@@ -7,6 +7,7 @@
 | 版本 | 日期 | 作者 | 变更内容 |
 |------|------|------|----------|
 | v1.0 | 2024-01-20 | System | 初始版本，完成分布式配置中心整体设计 |
+| v2.0 | 2024-01-20 | System | 添加性能优化设计：引入Redis缓存层、并发控制、请求限流、多版本配置支持 |
 
 ## 二、项目概述
 
@@ -26,6 +27,9 @@
 - 实时配置推送能力
 - 配置版本管理
 - 高可用的分布式架构
+- 高性能缓存层支持
+- 并发控制与限流保护
+- 多版本配置并存能力
 
 ## 三、详细设计
 
@@ -45,21 +49,25 @@ graph TB
         LB[负载均衡器<br/>Nginx/HAProxy]
     end
     
+    subgraph "缓存层"
+        RC[Redis集群<br/>缓存层]
+    end
+    
     subgraph "配置中心集群"
         subgraph "节点1"
-            API1[HTTP API]
+            API1[HTTP API<br/>+限流器]
             RS1[Raft Server]
             DS1[Data Store]
         end
         
         subgraph "节点2"
-            API2[HTTP API]
+            API2[HTTP API<br/>+限流器]
             RS2[Raft Server]
             DS2[Data Store]
         end
         
         subgraph "节点3"
-            API3[HTTP API]
+            API3[HTTP API<br/>+限流器]
             RS3[Raft Server]
             DS3[Data Store]
         end
@@ -74,9 +82,10 @@ graph TB
     C3 --> LB
     Admin --> LB
     
-    LB --> API1
-    LB --> API2
-    LB --> API3
+    LB --> RC
+    RC --> API1
+    RC --> API2
+    RC --> API3
     
     API1 <--> RS1
     API2 <--> RS2
@@ -90,6 +99,7 @@ graph TB
     RS2 <-.-> RS3
     RS1 <-.-> RS3
     
+    style RC fill:#faa,stroke:#333,stroke-width:2px
     style RS1 fill:#f9f,stroke:#333,stroke-width:2px
     style RS2 fill:#bbf,stroke:#333,stroke-width:2px
     style RS3 fill:#bbf,stroke:#333,stroke-width:2px
@@ -137,6 +147,8 @@ graph TB
 sequenceDiagram
     participant Client
     participant LoadBalancer
+    participant RateLimiter
+    participant RedisCache
     participant APIServer
     participant RaftLeader
     participant RaftFollowers
@@ -144,16 +156,19 @@ sequenceDiagram
     participant DataStore
     
     Client->>LoadBalancer: 1. 配置更新请求
-    LoadBalancer->>APIServer: 2. 转发请求
-    APIServer->>APIServer: 3. 参数校验
-    APIServer->>RaftLeader: 4. 提交Raft日志
-    RaftLeader->>RaftFollowers: 5. 日志复制
-    RaftFollowers-->>RaftLeader: 6. 复制确认
-    RaftLeader->>StateManager: 7. 应用到状态机
-    StateManager->>DataStore: 8. 持久化数据
-    StateManager-->>RaftLeader: 9. 应用完成
-    RaftLeader-->>APIServer: 10. 提交成功
-    APIServer-->>Client: 11. 返回响应
+    LoadBalancer->>RateLimiter: 2. 转发请求
+    RateLimiter->>RateLimiter: 3. 限流检查
+    RateLimiter->>APIServer: 4. 通过限流
+    APIServer->>APIServer: 5. 参数校验
+    APIServer->>RaftLeader: 6. 提交Raft日志
+    RaftLeader->>RaftFollowers: 7. 日志复制
+    RaftFollowers-->>RaftLeader: 8. 复制确认
+    RaftLeader->>StateManager: 9. 应用到状态机
+    StateManager->>DataStore: 10. 持久化数据
+    StateManager->>RedisCache: 11. 更新缓存
+    StateManager-->>RaftLeader: 12. 应用完成
+    RaftLeader-->>APIServer: 13. 提交成功
+    APIServer-->>Client: 14. 返回响应
 ```
 
 ### 3.2 数据库设计
@@ -242,6 +257,25 @@ CREATE TABLE raft_state (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Raft状态表';
 ```
 
+##### 6. config_version表（新增）
+```sql
+CREATE TABLE config_version (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    config_id BIGINT NOT NULL COMMENT '配置ID',
+    namespace_id BIGINT NOT NULL COMMENT '命名空间ID',
+    key VARCHAR(256) NOT NULL COMMENT '配置键',
+    value TEXT NOT NULL COMMENT '配置值(JSON格式)',
+    version INT NOT NULL COMMENT '版本号',
+    status TINYINT NOT NULL DEFAULT 1 COMMENT '状态: 1-启用, 0-禁用',
+    created_by VARCHAR(64) COMMENT '创建人',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_config_id (config_id),
+    INDEX idx_namespace_key_version (namespace_id, key, version),
+    INDEX idx_status (status),
+    UNIQUE KEY uk_config_version (config_id, version)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='配置版本表，存储所有历史版本';
+```
+
 ### 3.3 系统功能设计
 
 #### 3.3.1 功能模块划分
@@ -253,6 +287,7 @@ graph LR
         CM2[版本管理]
         CM3[配置回滚]
         CM4[批量操作]
+        CM5[多版本并存]
     end
     
     subgraph "命名空间模块"
@@ -264,6 +299,7 @@ graph LR
         CI1[配置拉取]
         CI2[配置监听]
         CI3[缓存管理]
+        CI4[版本选择]
     end
     
     subgraph "分布式模块"
@@ -271,6 +307,13 @@ graph LR
         DM2[日志复制]
         DM3[数据同步]
         DM4[故障转移]
+    end
+    
+    subgraph "性能优化模块"
+        PM1[Redis缓存]
+        PM2[并发控制]
+        PM3[请求限流]
+        PM4[缓存更新]
     end
     
     subgraph "监控模块"
@@ -304,23 +347,29 @@ flowchart TB
     ReturnSuccess --> End
 ```
 
-##### 2. 配置读取流程
+##### 2. 配置读取流程（优化后）
 
 ```mermaid
 flowchart TB
-    Start([开始]) --> CheckCache{检查本地缓存}
-    CheckCache -->|命中| ReturnCache[返回缓存数据]
-    CheckCache -->|未命中| CheckRole{检查节点角色}
+    Start([开始]) --> CheckRedis{检查Redis缓存}
+    CheckRedis -->|命中| ReturnRedis[返回缓存数据]
+    CheckRedis -->|未命中| CheckLocalCache{检查本地缓存}
+    CheckLocalCache -->|命中| CheckVersion{检查版本}
+    CheckLocalCache -->|未命中| CheckRole{检查节点角色}
+    CheckVersion -->|版本匹配| ReturnLocal[返回本地缓存]
+    CheckVersion -->|版本不匹配| CheckRole
     CheckRole -->|Leader| QueryDB[查询数据库]
     CheckRole -->|Follower| ForwardLeader{转发到Leader}
     ForwardLeader -->|成功| QueryDB
     ForwardLeader -->|失败| QueryLocalDB[查询本地数据库]
-    QueryDB --> UpdateCache[更新缓存]
+    QueryDB --> UpdateRedis[更新Redis缓存]
     QueryLocalDB --> CheckStale{检查数据时效}
     CheckStale -->|过期| ReturnError[返回错误]
-    CheckStale -->|有效| UpdateCache
-    UpdateCache --> ReturnData[返回数据]
-    ReturnCache --> End([结束])
+    CheckStale -->|有效| UpdateRedis
+    UpdateRedis --> UpdateLocal[更新本地缓存]
+    UpdateLocal --> ReturnData[返回数据]
+    ReturnRedis --> End([结束])
+    ReturnLocal --> End
     ReturnData --> End
     ReturnError --> End
 ```
@@ -362,9 +411,240 @@ stateDiagram-v2
     }
 ```
 
-### 3.4 接口设计
+### 3.4 缓存设计（新增）
 
-#### 3.4.1 API设计原则
+#### 3.4.1 Redis缓存策略
+
+##### 1. 缓存数据结构设计
+
+```
+# 配置缓存
+Key: config:{namespace}:{key}
+Value: {
+    "value": {...},      # 配置值
+    "version": 3,        # 当前版本
+    "updated_at": "...", # 更新时间
+    "ttl": 3600         # 过期时间(秒)
+}
+TTL: 1小时（热点数据自动续期）
+
+# 配置版本缓存
+Key: config:version:{namespace}:{key}:{version}
+Value: {
+    "value": {...},      # 该版本的配置值
+    "created_at": "..."  # 创建时间
+}
+TTL: 24小时
+
+# 命名空间配置集合
+Key: namespace:configs:{namespace}
+Type: Hash
+Field: {key}
+Value: {
+    "version": 3,
+    "value": {...}
+}
+TTL: 1小时
+
+# 配置版本列表
+Key: config:versions:{namespace}:{key}
+Type: Sorted Set
+Member: version
+Score: timestamp
+TTL: 永不过期
+```
+
+##### 2. 缓存更新策略
+
+```mermaid
+flowchart LR
+    subgraph "写入路径"
+        Write[配置更新] --> Raft[Raft共识]
+        Raft --> DB[数据库写入]
+        DB --> InvalidateCache[缓存失效]
+        InvalidateCache --> PublishEvent[发布更新事件]
+    end
+    
+    subgraph "读取路径"
+        Read[配置读取] --> CheckCache{缓存检查}
+        CheckCache -->|命中| ReturnCache[返回缓存]
+        CheckCache -->|未命中| LoadDB[加载数据库]
+        LoadDB --> UpdateCache[更新缓存]
+        UpdateCache --> ReturnData[返回数据]
+    end
+    
+    subgraph "事件处理"
+        PublishEvent --> Subscriber[订阅者]
+        Subscriber --> RefreshLocal[刷新本地缓存]
+    end
+```
+
+#### 3.4.2 缓存一致性保证
+
+##### 1. 缓存更新机制
+
+采用**Cache-Aside Pattern**结合**发布订阅**模式：
+- 写操作：先更新数据库，再删除缓存，最后发布更新事件
+- 读操作：先查缓存，未命中则查数据库并更新缓存
+- 事件通知：通过Redis Pub/Sub通知所有节点更新本地缓存
+
+##### 2. 分布式锁机制
+
+```go
+// 使用Redis分布式锁防止缓存击穿
+lockKey := fmt.Sprintf("lock:config:%s:%s", namespace, key)
+lock := redis.SetNX(lockKey, nodeID, 5*time.Second)
+if lock {
+    defer redis.Del(lockKey)
+    // 加载数据并更新缓存
+}
+```
+
+##### 3. 缓存预热
+
+```mermaid
+flowchart TB
+    Start[服务启动] --> LoadHotConfigs[加载热点配置列表]
+    LoadHotConfigs --> BatchLoad[批量加载配置]
+    BatchLoad --> WarmCache[预热Redis缓存]
+    WarmCache --> WarmLocal[预热本地缓存]
+    WarmLocal --> Ready[服务就绪]
+```
+
+### 3.5 并发控制与限流设计（新增）
+
+#### 3.5.1 并发控制
+
+##### 1. 请求级并发控制
+
+```go
+// 使用令牌桶算法实现请求限流
+type RateLimiter struct {
+    rate       int           // 每秒允许的请求数
+    capacity   int           // 桶容量
+    tokens     int           // 当前令牌数
+    lastUpdate time.Time     // 上次更新时间
+    mu         sync.Mutex    // 互斥锁
+}
+
+// 全局限流配置
+var limiters = map[string]*RateLimiter{
+    "read":  NewRateLimiter(10000, 20000),  // 读请求：10000 QPS
+    "write": NewRateLimiter(1000, 2000),    // 写请求：1000 QPS
+    "admin": NewRateLimiter(100, 200),      // 管理请求：100 QPS
+}
+```
+
+##### 2. 客户端级限流
+
+```yaml
+# 限流规则配置
+rate_limits:
+  default:
+    read_qps: 1000      # 默认每客户端读QPS
+    write_qps: 100      # 默认每客户端写QPS
+  
+  vip_clients:         # VIP客户端配置
+    - client_id: "core-service"
+      read_qps: 5000
+      write_qps: 500
+```
+
+#### 3.5.2 限流实现
+
+##### 1. 限流中间件
+
+```mermaid
+flowchart TB
+    Request[请求到达] --> GetClientID[获取客户端ID]
+    GetClientID --> CheckGlobal{全局限流检查}
+    CheckGlobal -->|超限| RejectGlobal[返回429错误]
+    CheckGlobal -->|通过| CheckClient{客户端限流检查}
+    CheckClient -->|超限| RejectClient[返回429错误]
+    CheckClient -->|通过| ProcessRequest[处理请求]
+    ProcessRequest --> Response[返回响应]
+    RejectGlobal --> End[结束]
+    RejectClient --> End
+    Response --> End
+```
+
+##### 2. 限流响应
+
+```json
+{
+    "code": 42901,
+    "message": "请求过于频繁，请稍后重试",
+    "error": {
+        "retry_after": 1,        // 建议重试时间(秒)
+        "limit": 1000,          // 限流阈值
+        "remaining": 0,         // 剩余配额
+        "reset": 1705734460     // 配额重置时间
+    },
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "timestamp": 1705734400
+}
+```
+
+### 3.6 多版本配置管理（新增）
+
+#### 3.6.1 版本管理策略
+
+##### 1. 版本存储
+
+- 每次配置更新生成新版本，保留历史版本
+- 支持按版本号、时间戳查询历史配置
+- 可配置版本保留策略（如保留最近30个版本）
+
+##### 2. 版本清理策略
+
+```mermaid
+flowchart LR
+    subgraph "版本保留策略"
+        VS1[保留最新N个版本]
+        VS2[保留最近M天版本]
+        VS3[保留标记版本]
+    end
+    
+    subgraph "清理任务"
+        CT1[定时清理任务]
+        CT2[手动清理触发]
+    end
+    
+    VS1 --> CleanupLogic[清理逻辑]
+    VS2 --> CleanupLogic
+    VS3 --> CleanupLogic
+    CT1 --> CleanupLogic
+    CT2 --> CleanupLogic
+    CleanupLogic --> Archive[归档历史数据]
+    CleanupLogic --> Delete[删除过期版本]
+```
+
+#### 3.6.2 版本访问接口
+
+##### 1. 指定版本获取
+
+```bash
+# 获取特定版本配置
+GET /api/v1/config/get?namespace=user-service&key=database.mysql&version=3
+```
+
+##### 2. 版本范围查询
+
+```bash
+# 获取版本列表
+GET /api/v1/config/versions?namespace=user-service&key=database.mysql&limit=10
+```
+
+##### 3. 版本对比
+
+```bash
+# 对比两个版本差异
+GET /api/v1/config/diff?namespace=user-service&key=database.mysql&from=3&to=5
+```
+
+### 3.7 接口设计
+
+#### 3.7.1 API设计原则
 
 遵循365 API规范：
 1. RESTful风格设计
@@ -373,7 +653,7 @@ stateDiagram-v2
 4. 版本化管理
 5. 统一的错误处理
 
-#### 3.4.2 统一响应格式
+#### 3.7.2 统一响应格式
 
 ```json
 {
@@ -398,7 +678,7 @@ stateDiagram-v2
 }
 ```
 
-#### 3.4.3 客户端配置读取接口
+#### 3.7.3 客户端配置读取接口
 
 ##### 1. 获取单个配置
 
@@ -409,10 +689,15 @@ stateDiagram-v2
 |--------|------|------|------|
 | namespace | string | 是 | 命名空间 |
 | key | string | 是 | 配置键 |
+| version | int | 否 | 配置版本号，不传则返回最新版本 |
 
 **请求示例**:
 ```bash
+# 获取最新版本
 GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
+
+# 获取指定版本
+GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 ```
 
 **响应示例**:
@@ -516,7 +801,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
 }
 ```
 
-#### 3.4.4 后台管理接口
+#### 3.7.4 后台管理接口（增强版本管理）
 
 ##### 1. 创建配置
 
@@ -729,7 +1014,100 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
 }
 ```
 
-#### 3.4.5 命名空间管理接口
+#### 3.7.5 版本管理接口（新增）
+
+##### 1. 获取配置版本列表
+
+**接口地址**: `GET /api/v1/config/versions`
+
+**请求参数**:
+| 参数名 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| namespace | string | 是 | 命名空间 |
+| key | string | 是 | 配置键 |
+| page | int | 否 | 页码，默认1 |
+| page_size | int | 否 | 每页数量，默认20 |
+
+**响应示例**:
+```json
+{
+    "code": 0,
+    "message": "success",
+    "data": {
+        "list": [
+            {
+                "version": 5,
+                "value": {
+                    "host": "192.168.1.200"
+                },
+                "created_by": "admin",
+                "created_at": "2024-01-20T12:00:00Z",
+                "is_current": true
+            },
+            {
+                "version": 4,
+                "value": {
+                    "host": "192.168.1.150"
+                },
+                "created_by": "admin",
+                "created_at": "2024-01-20T11:00:00Z",
+                "is_current": false
+            }
+        ],
+        "pagination": {
+            "page": 1,
+            "page_size": 20,
+            "total": 5
+        }
+    },
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "timestamp": 1705734400
+}
+```
+
+##### 2. 配置版本对比
+
+**接口地址**: `GET /api/v1/config/diff`
+
+**请求参数**:
+| 参数名 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| namespace | string | 是 | 命名空间 |
+| key | string | 是 | 配置键 |
+| from_version | int | 是 | 起始版本号 |
+| to_version | int | 是 | 目标版本号 |
+
+**响应示例**:
+```json
+{
+    "code": 0,
+    "message": "success",
+    "data": {
+        "namespace": "user-service",
+        "key": "database.mysql",
+        "from_version": 3,
+        "to_version": 5,
+        "changes": [
+            {
+                "path": "host",
+                "from": "192.168.1.100",
+                "to": "192.168.1.200",
+                "type": "modified"
+            },
+            {
+                "path": "max_connections",
+                "from": null,
+                "to": 100,
+                "type": "added"
+            }
+        ]
+    },
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "timestamp": 1705734400
+}
+```
+
+#### 3.7.6 命名空间管理接口
 
 ##### 1. 创建命名空间
 
@@ -790,7 +1168,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
 | page | int | 否 | 页码 |
 | page_size | int | 否 | 每页数量 |
 
-#### 3.4.6 错误码定义
+#### 3.7.7 错误码定义（更新）
 
 | 错误码 | 说明 | HTTP状态码 |
 |--------|------|-------------|
@@ -807,6 +1185,9 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
 | 50001 | 服务内部错误 | 500 |
 | 50002 | 数据库错误 | 500 |
 | 50003 | Raft共识失败 | 500 |
+| 50004 | 缓存服务异常 | 500 |
+| 42901 | 请求频率超限 | 429 |
+| 42902 | 客户端配额超限 | 429 |
 | 50301 | 服务不可用 | 503 |
 | 50302 | 节点非Leader | 503 |
 
@@ -826,6 +1207,12 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
 | Term | Raft协议中的任期概念，每次选举会增加任期号 |
 | Log Entry | Raft日志条目，记录每个操作命令 |
 | State Machine | 状态机，将Raft日志应用到实际业务数据的组件 |
+| Redis | 开源的内存数据结构存储系统，用作缓存层 |
+| Cache-Aside Pattern | 缓存模式，应用程序负责从数据源加载数据到缓存 |
+| Rate Limiting | 限流，控制请求频率的技术 |
+| Token Bucket | 令牌桶算法，一种常用的限流算法 |
+| TTL | Time To Live，数据的存活时间 |
+| QPS | Queries Per Second，每秒查询数 |
 
 ### 5.2 参考资料
 
@@ -836,3 +1223,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host
 5. [分布式系统一致性](https://www.allthingsdistributed.com/2008/12/eventually_consistent.html)
 6. [CAP理论](https://en.wikipedia.org/wiki/CAP_theorem)
 7. [365 API设计规范](https://365.design/api-guidelines)
+8. [Redis官方文档](https://redis.io/documentation)
+9. [分布式缓存最佳实践](https://docs.microsoft.com/en-us/azure/architecture/best-practices/caching)
+10. [Rate Limiting算法详解](https://www.cloudflare.com/learning/bots/what-is-rate-limiting/)
+11. [高并发系统设计](https://github.com/donnemartin/system-design-primer)

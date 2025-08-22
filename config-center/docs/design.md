@@ -9,6 +9,7 @@
 | v1.0 | 2024-01-20 | System | 初始版本，完成分布式配置中心整体设计 |
 | v2.0 | 2024-01-20 | System | 添加性能优化设计：引入Redis缓存层、并发控制、请求限流、多版本配置支持 |
 | v3.0 | 2024-01-20 | System | 添加可用性与监控设计：接口埋点、链路跟踪、性能监控、数据库故障降级方案 |
+| v4.0 | 2024-01-20 | System | 添加推拉结合热更新设计：WebSocket推送、配置订阅、增量diff、客户端SDK |
 
 ## 二、项目概述
 
@@ -1069,9 +1070,489 @@ groups:
 }
 ```
 
-### 3.8 接口设计
+### 3.8 推拉结合热更新设计（新增）
 
-#### 3.8.1 API设计原则
+#### 3.8.1 热更新架构设计
+
+```mermaid
+graph TB
+    subgraph "客户端"
+        App[应用服务]
+        SDK[配置中心SDK]
+        LC[本地缓存]
+        App --> SDK
+        SDK --> LC
+    end
+    
+    subgraph "配置中心"
+        subgraph "API层"
+            HTTP[HTTP API]
+            WS[WebSocket Server]
+        end
+        
+        subgraph "推送层"
+            PM[推送管理器]
+            SM[订阅管理器]
+            CM[连接管理器]
+        end
+        
+        subgraph "核心层"
+            CS[配置服务]
+            VS[版本服务]
+            DS[Diff服务]
+        end
+    end
+    
+    SDK -->|定期拉取| HTTP
+    SDK <-->|长连接| WS
+    
+    HTTP --> CS
+    WS --> PM
+    PM --> SM
+    PM --> CM
+    
+    CS --> VS
+    CS --> DS
+    
+    CS -->|配置变更事件| PM
+    
+    style WS fill:#faa,stroke:#333,stroke-width:2px
+    style PM fill:#afa,stroke:#333,stroke-width:2px
+```
+
+#### 3.8.2 WebSocket推送机制
+
+##### 1. 连接管理
+
+```go
+type ConnectionManager struct {
+    connections map[string]*ClientConnection // clientID -> connection
+    mu          sync.RWMutex
+}
+
+type ClientConnection struct {
+    ClientID     string
+    Conn         *websocket.Conn
+    Namespaces   []string              // 订阅的命名空间
+    ConfigKeys   map[string][]string   // namespace -> keys
+    LastPingTime time.Time
+    mu           sync.Mutex
+}
+
+// WebSocket连接处理
+func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        return
+    }
+    
+    clientID := r.Header.Get("X-Client-ID")
+    client := &ClientConnection{
+        ClientID:     clientID,
+        Conn:         conn,
+        Namespaces:   make([]string, 0),
+        ConfigKeys:   make(map[string][]string),
+        LastPingTime: time.Now(),
+    }
+    
+    s.connMgr.AddConnection(clientID, client)
+    defer s.connMgr.RemoveConnection(clientID)
+    
+    // 处理消息
+    go s.handleMessages(client)
+    
+    // 心跳检测
+    go s.heartbeat(client)
+}
+```
+
+##### 2. 消息协议
+
+```json
+// 客户端订阅请求
+{
+    "type": "subscribe",
+    "data": {
+        "namespace": "user-service",
+        "keys": ["database.mysql", "redis.cluster"]
+    }
+}
+
+// 服务端推送通知
+{
+    "type": "config_change",
+    "data": {
+        "namespace": "user-service",
+        "changes": [
+            {
+                "key": "database.mysql",
+                "old_version": 3,
+                "new_version": 4,
+                "operation": "update",
+                "value": {...}
+            }
+        ],
+        "timestamp": 1705734400
+    }
+}
+
+// 心跳消息
+{
+    "type": "ping",
+    "timestamp": 1705734400
+}
+```
+
+##### 3. 推送流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant WebSocket
+    participant SubscriptionMgr
+    participant ConfigService
+    participant PushManager
+    
+    Client->>WebSocket: 1. 建立连接
+    Client->>WebSocket: 2. 订阅配置
+    WebSocket->>SubscriptionMgr: 3. 注册订阅
+    
+    Note over ConfigService: 配置更新发生
+    
+    ConfigService->>PushManager: 4. 发布变更事件
+    PushManager->>SubscriptionMgr: 5. 查询订阅者
+    SubscriptionMgr-->>PushManager: 6. 返回订阅列表
+    PushManager->>WebSocket: 7. 推送变更
+    WebSocket->>Client: 8. 发送通知
+    Client->>Client: 9. 更新本地缓存
+```
+
+#### 3.8.3 推拉结合同步策略
+
+##### 1. 客户端SDK设计
+
+```go
+type ConfigClient struct {
+    httpClient   *http.Client
+    wsClient     *websocket.Conn
+    cache        *LocalCache
+    pullInterval time.Duration
+    subscribers  map[string][]ConfigChangeHandler
+}
+
+// 配置变更处理器
+type ConfigChangeHandler func(namespace, key string, oldValue, newValue interface{})
+
+// 初始化客户端
+func NewConfigClient(options *ClientOptions) *ConfigClient {
+    client := &ConfigClient{
+        httpClient:   &http.Client{Timeout: options.Timeout},
+        cache:        NewLocalCache(),
+        pullInterval: options.PullInterval,
+        subscribers:  make(map[string][]ConfigChangeHandler),
+    }
+    
+    // 启动定期拉取
+    go client.startPullLoop()
+    
+    // 建立WebSocket连接
+    go client.connectWebSocket(options.ServerURL)
+    
+    return client
+}
+
+// 获取配置（优先本地缓存）
+func (c *ConfigClient) Get(namespace, key string) (interface{}, error) {
+    // 1. 查询本地缓存
+    if value, ok := c.cache.Get(namespace, key); ok {
+        return value, nil
+    }
+    
+    // 2. 缓存未命中，主动拉取
+    config, err := c.pullConfig(namespace, key)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 3. 更新缓存
+    c.cache.Set(namespace, key, config)
+    
+    return config.Value, nil
+}
+```
+
+##### 2. 同步策略实现
+
+```mermaid
+flowchart TB
+    subgraph "主动拉取"
+        Timer[定时器] --> CheckVersion{检查版本}
+        CheckVersion -->|版本不一致| PullConfig[拉取配置]
+        CheckVersion -->|版本一致| Skip[跳过]
+        PullConfig --> UpdateCache[更新缓存]
+        UpdateCache --> NotifyApp[通知应用]
+    end
+    
+    subgraph "被动推送"
+        WSReceive[接收推送] --> ValidateChange{验证变更}
+        ValidateChange -->|有效| UpdateCacheWS[更新缓存]
+        ValidateChange -->|无效| IgnoreWS[忽略]
+        UpdateCacheWS --> NotifyAppWS[通知应用]
+    end
+    
+    subgraph "容错机制"
+        WSError[WebSocket断开] --> Reconnect[重连]
+        Reconnect -->|成功| ReSubscribe[重新订阅]
+        Reconnect -->|失败| FallbackPull[降级到拉取]
+    end
+```
+
+##### 3. 定期拉取实现
+
+```go
+func (c *ConfigClient) startPullLoop() {
+    ticker := time.NewTicker(c.pullInterval)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        // 批量检查版本
+        versions := c.cache.GetAllVersions()
+        updates, err := c.checkBatchVersions(versions)
+        if err != nil {
+            log.Printf("Check versions error: %v", err)
+            continue
+        }
+        
+        // 拉取更新的配置
+        for _, update := range updates {
+            config, err := c.pullConfig(update.Namespace, update.Key)
+            if err != nil {
+                log.Printf("Pull config error: %v", err)
+                continue
+            }
+            
+            // 更新缓存并通知
+            c.updateAndNotify(update.Namespace, update.Key, config)
+        }
+    }
+}
+```
+
+#### 3.8.4 配置版本Diff功能
+
+##### 1. Diff接口设计
+
+**接口地址**: `GET /api/v1/config/diff-sync`
+
+**请求参数**:
+| 参数名 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| namespace | string | 是 | 命名空间 |
+| current_versions | object | 是 | 客户端当前版本信息 {"key1": version1, "key2": version2} |
+
+**响应示例**:
+```json
+{
+    "code": 0,
+    "message": "success",
+    "data": {
+        "namespace": "user-service",
+        "changes": [
+            {
+                "key": "database.mysql",
+                "operation": "update",
+                "current_version": 5,
+                "client_version": 3,
+                "diff": {
+                    "added": {
+                        "max_connections": 100
+                    },
+                    "modified": {
+                        "host": {
+                            "old": "192.168.1.100",
+                            "new": "192.168.1.200"
+                        }
+                    },
+                    "deleted": {}
+                },
+                "full_value": {
+                    "host": "192.168.1.200",
+                    "port": 3306,
+                    "max_connections": 100
+                }
+            },
+            {
+                "key": "new.config",
+                "operation": "create",
+                "current_version": 1,
+                "client_version": null,
+                "full_value": {
+                    "enabled": true
+                }
+            }
+        ],
+        "deleted_keys": ["deprecated.config"]
+    },
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "timestamp": 1705734400
+}
+```
+
+##### 2. Diff算法实现
+
+```go
+type DiffService struct {
+    configService *ConfigService
+}
+
+// 计算配置差异
+func (d *DiffService) CalculateDiff(namespace string, clientVersions map[string]int) (*DiffResult, error) {
+    result := &DiffResult{
+        Namespace: namespace,
+        Changes:   make([]ConfigChange, 0),
+    }
+    
+    // 获取服务端当前所有配置
+    serverConfigs, err := d.configService.GetNamespaceConfigs(namespace)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 计算变更和新增
+    for key, serverConfig := range serverConfigs {
+        clientVersion, exists := clientVersions[key]
+        
+        if !exists {
+            // 新增配置
+            result.Changes = append(result.Changes, ConfigChange{
+                Key:            key,
+                Operation:      "create",
+                CurrentVersion: serverConfig.Version,
+                FullValue:      serverConfig.Value,
+            })
+        } else if clientVersion < serverConfig.Version {
+            // 配置有更新
+            oldConfig, _ := d.configService.GetConfigByVersion(namespace, key, clientVersion)
+            diff := d.calculateJSONDiff(oldConfig.Value, serverConfig.Value)
+            
+            result.Changes = append(result.Changes, ConfigChange{
+                Key:            key,
+                Operation:      "update",
+                CurrentVersion: serverConfig.Version,
+                ClientVersion:  &clientVersion,
+                Diff:           diff,
+                FullValue:      serverConfig.Value,
+            })
+        }
+    }
+    
+    // 计算删除
+    for key, _ := range clientVersions {
+        if _, exists := serverConfigs[key]; !exists {
+            result.DeletedKeys = append(result.DeletedKeys, key)
+        }
+    }
+    
+    return result, nil
+}
+
+// 计算JSON差异
+func (d *DiffService) calculateJSONDiff(old, new interface{}) *JSONDiff {
+    diff := &JSONDiff{
+        Added:    make(map[string]interface{}),
+        Modified: make(map[string]DiffValue),
+        Deleted:  make(map[string]interface{}),
+    }
+    
+    oldMap := toMap(old)
+    newMap := toMap(new)
+    
+    // 查找新增和修改
+    for key, newValue := range newMap {
+        if oldValue, exists := oldMap[key]; exists {
+            if !reflect.DeepEqual(oldValue, newValue) {
+                diff.Modified[key] = DiffValue{
+                    Old: oldValue,
+                    New: newValue,
+                }
+            }
+        } else {
+            diff.Added[key] = newValue
+        }
+    }
+    
+    // 查找删除
+    for key, oldValue := range oldMap {
+        if _, exists := newMap[key]; !exists {
+            diff.Deleted[key] = oldValue
+        }
+    }
+    
+    return diff
+}
+```
+
+##### 3. 增量更新流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant ConfigAPI
+    participant DiffService
+    participant Cache
+    
+    Client->>Client: 1. 收集本地版本信息
+    Client->>ConfigAPI: 2. 请求差异同步
+    ConfigAPI->>DiffService: 3. 计算版本差异
+    DiffService->>Cache: 4. 查询历史版本
+    Cache-->>DiffService: 5. 返回版本数据
+    DiffService->>DiffService: 6. 计算JSON Diff
+    DiffService-->>ConfigAPI: 7. 返回差异结果
+    ConfigAPI-->>Client: 8. 返回增量数据
+    Client->>Client: 9. 合并更新本地配置
+    Client->>Client: 10. 更新版本信息
+```
+
+#### 3.8.5 客户端SDK使用示例
+
+```go
+// 初始化配置客户端
+client := configcenter.NewClient(&configcenter.ClientOptions{
+    ServerURL:     "ws://config-center.example.com",
+    ClientID:      "user-service-001",
+    PullInterval:  30 * time.Second,
+    RetryInterval: 5 * time.Second,
+})
+
+// 订阅配置变更
+client.Subscribe("user-service", []string{"database.mysql", "redis.cluster"}, 
+    func(namespace, key string, oldValue, newValue interface{}) {
+        log.Printf("Config changed: %s/%s", namespace, key)
+        // 处理配置变更
+    })
+
+// 获取配置
+mysqlConfig, err := client.Get("user-service", "database.mysql")
+if err != nil {
+    log.Fatal(err)
+}
+
+// 批量获取配置
+configs, err := client.BatchGet("user-service", []string{"database.mysql", "redis.cluster"})
+if err != nil {
+    log.Fatal(err)
+}
+
+// 手动触发同步
+err = client.Sync()
+if err != nil {
+    log.Printf("Sync failed: %v", err)
+}
+```
+
+### 3.9 接口设计
+
+#### 3.9.1 API设计原则
 
 遵循365 API规范：
 1. RESTful风格设计
@@ -1080,7 +1561,7 @@ groups:
 4. 版本化管理
 5. 统一的错误处理
 
-#### 3.8.2 统一响应格式
+#### 3.9.2 统一响应格式
 
 ```json
 {
@@ -1105,7 +1586,7 @@ groups:
 }
 ```
 
-#### 3.8.3 客户端配置读取接口
+#### 3.9.3 客户端配置读取接口
 
 ##### 1. 获取单个配置
 
@@ -1228,7 +1709,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 }
 ```
 
-#### 3.8.4 后台管理接口（增强版本管理）
+#### 3.9.4 后台管理接口（增强版本管理）
 
 ##### 1. 创建配置
 
@@ -1441,7 +1922,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 }
 ```
 
-#### 3.8.5 版本管理接口（新增）
+#### 3.9.5 版本管理接口（新增）
 
 ##### 1. 获取配置版本列表
 
@@ -1534,7 +2015,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 }
 ```
 
-#### 3.8.6 命名空间管理接口
+#### 3.9.6 命名空间管理接口
 
 ##### 1. 创建命名空间
 
@@ -1595,7 +2076,92 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 | page | int | 否 | 页码 |
 | page_size | int | 否 | 每页数量 |
 
-#### 3.8.7 监控接口（新增）
+#### 3.9.7 推送相关接口（新增）
+
+##### 1. WebSocket连接接口
+
+**接口地址**: `WS /api/v1/ws/connect`
+
+**请求头**:
+| 参数名 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| X-Client-ID | string | 是 | 客户端唯一标识 |
+| Authorization | string | 否 | 认证令牌 |
+
+**连接成功响应**:
+```json
+{
+    "type": "connected",
+    "data": {
+        "session_id": "ws-550e8400-e29b",
+        "server_time": 1705734400
+    }
+}
+```
+
+##### 2. 配置订阅接口
+
+**消息类型**: `subscribe`
+
+**请求消息**:
+```json
+{
+    "type": "subscribe",
+    "data": {
+        "namespace": "user-service",
+        "keys": ["database.mysql", "redis.cluster", "*"]  // "*"表示订阅该namespace下所有配置
+    }
+}
+```
+
+**响应消息**:
+```json
+{
+    "type": "subscribe_ack",
+    "data": {
+        "namespace": "user-service",
+        "subscribed_keys": ["database.mysql", "redis.cluster"],
+        "subscribe_all": false
+    }
+}
+```
+
+##### 3. 配置变更推送
+
+**消息类型**: `config_change`
+
+**推送消息**:
+```json
+{
+    "type": "config_change",
+    "data": {
+        "namespace": "user-service",
+        "changes": [
+            {
+                "key": "database.mysql",
+                "operation": "update",
+                "old_version": 3,
+                "new_version": 4,
+                "value": {
+                    "host": "192.168.1.200",
+                    "port": 3306
+                },
+                "diff": {
+                    "modified": {
+                        "host": {
+                            "old": "192.168.1.100",
+                            "new": "192.168.1.200"
+                        }
+                    }
+                }
+            }
+        ],
+        "timestamp": 1705734400
+    }
+}
+```
+
+#### 3.9.8 监控接口（新增）
 
 ##### 1. 健康检查接口
 
@@ -1647,7 +2213,7 @@ config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",
 config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",method="GET",le="50"} 9834
 ```
 
-#### 3.8.8 错误码定义（更新）
+#### 3.9.9 错误码定义（更新）
 
 | 错误码 | 说明 | HTTP状态码 |
 |--------|------|-------------|
@@ -1669,6 +2235,9 @@ config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",
 | 42902 | 客户端配额超限 | 429 |
 | 50301 | 服务不可用 | 503 |
 | 50302 | 节点非Leader | 503 |
+| 40005 | WebSocket连接失败 | 400 |
+| 40006 | 订阅参数错误 | 400 |
+| 50005 | 推送服务异常 | 500 |
 
 ## 五、附录
 
@@ -1701,6 +2270,14 @@ config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",
 | Health Check | 健康检查，用于监控服务可用性 |
 | Degraded Mode | 降级模式，系统部分功能不可用时的运行模式 |
 | Circuit Breaker | 熔断器，防止故障扩散的保护机制 |
+| WebSocket | 在单个TCP连接上进行全双工通信的协议 |
+| Long Polling | 长轮询，一种服务端推送技术 |
+| Push-Pull Model | 推拉结合模型，结合主动拉取和被动推送的数据同步模式 |
+| Diff | 差异，表示两个版本之间的变化 |
+| Incremental Update | 增量更新，只传输变化的部分而非全量数据 |
+| SDK | Software Development Kit，软件开发工具包 |
+| Subscription | 订阅，客户端注册对特定配置的关注 |
+| Heartbeat | 心跳，用于检测连接活性的定期消息 |
 
 ### 5.2 参考资料
 
@@ -1720,3 +2297,7 @@ config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",
 14. [OpenTracing规范](https://opentracing.io/specification/)
 15. [监控系统设计模式](https://sre.google/sre-book/monitoring-distributed-systems/)
 16. [服务降级最佳实践](https://martinfowler.com/bliki/CircuitBreaker.html)
+17. [WebSocket协议规范](https://tools.ietf.org/html/rfc6455)
+18. [实时推送架构设计](https://www.pubnub.com/blog/websockets-vs-long-polling/)
+19. [配置热更新最佳实践](https://netflixtechblog.com/archaius-dynamic-configuration-at-netflix-1868d0df6b3d)
+20. [增量同步算法](https://github.com/google/diff-match-patch)

@@ -8,6 +8,7 @@
 |------|------|------|----------|
 | v1.0 | 2024-01-20 | System | 初始版本，完成分布式配置中心整体设计 |
 | v2.0 | 2024-01-20 | System | 添加性能优化设计：引入Redis缓存层、并发控制、请求限流、多版本配置支持 |
+| v3.0 | 2024-01-20 | System | 添加可用性与监控设计：接口埋点、链路跟踪、性能监控、数据库故障降级方案 |
 
 ## 二、项目概述
 
@@ -642,9 +643,435 @@ GET /api/v1/config/versions?namespace=user-service&key=database.mysql&limit=10
 GET /api/v1/config/diff?namespace=user-service&key=database.mysql&from=3&to=5
 ```
 
-### 3.7 接口设计
+### 3.7 监控与可用性设计（新增）
 
-#### 3.7.1 API设计原则
+#### 3.7.1 监控体系架构
+
+```mermaid
+graph TB
+    subgraph "应用层"
+        App[配置中心服务]
+        SDK[监控SDK]
+        App --> SDK
+    end
+    
+    subgraph "采集层"
+        Collector[Metrics Collector]
+        Tracer[Trace Collector]
+        Logger[Log Collector]
+    end
+    
+    subgraph "存储层"
+        Prometheus[Prometheus<br/>时序数据库]
+        Jaeger[Jaeger<br/>链路追踪]
+        ES[ElasticSearch<br/>日志存储]
+    end
+    
+    subgraph "展示层"
+        Grafana[Grafana<br/>监控大盘]
+        JaegerUI[Jaeger UI<br/>链路查询]
+        Kibana[Kibana<br/>日志分析]
+        AlertManager[AlertManager<br/>告警管理]
+    end
+    
+    SDK --> Collector
+    SDK --> Tracer
+    SDK --> Logger
+    
+    Collector --> Prometheus
+    Tracer --> Jaeger
+    Logger --> ES
+    
+    Prometheus --> Grafana
+    Prometheus --> AlertManager
+    Jaeger --> JaegerUI
+    ES --> Kibana
+```
+
+#### 3.7.2 接口埋点设计
+
+##### 1. 埋点数据结构
+
+```go
+type MetricsPoint struct {
+    // 基础信息
+    RequestID    string    `json:"request_id"`
+    TraceID      string    `json:"trace_id"`
+    SpanID       string    `json:"span_id"`
+    
+    // 接口信息
+    API          string    `json:"api"`           // 接口路径
+    Method       string    `json:"method"`        // HTTP方法
+    Namespace    string    `json:"namespace"`     // 命名空间
+    ConfigKey    string    `json:"config_key"`    // 配置键
+    
+    // 性能指标
+    Duration     int64     `json:"duration_ms"`   // 响应时间(ms)
+    StatusCode   int       `json:"status_code"`   // HTTP状态码
+    ErrorCode    int       `json:"error_code"`    // 业务错误码
+    
+    // 客户端信息
+    ClientID     string    `json:"client_id"`     // 客户端标识
+    ClientIP     string    `json:"client_ip"`     // 客户端IP
+    UserAgent    string    `json:"user_agent"`    // User-Agent
+    
+    // 服务端信息
+    NodeID       string    `json:"node_id"`       // 节点ID
+    Version      string    `json:"version"`       // 服务版本
+    
+    // 时间戳
+    StartTime    time.Time `json:"start_time"`
+    EndTime      time.Time `json:"end_time"`
+}
+```
+
+##### 2. 埋点中间件实现
+
+```go
+func MetricsMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // 生成追踪信息
+        traceID := r.Header.Get("X-Trace-ID")
+        if traceID == "" {
+            traceID = uuid.New().String()
+        }
+        
+        // 创建span
+        span := tracer.StartSpan(r.URL.Path,
+            opentracing.Tag{Key: "http.method", Value: r.Method},
+            opentracing.Tag{Key: "http.url", Value: r.URL.String()},
+        )
+        defer span.Finish()
+        
+        // 记录开始时间
+        startTime := time.Now()
+        
+        // 包装ResponseWriter以捕获状态码
+        wrapped := &responseWriter{ResponseWriter: w}
+        
+        // 处理请求
+        next.ServeHTTP(wrapped, r)
+        
+        // 计算耗时
+        duration := time.Since(startTime).Milliseconds()
+        
+        // 记录指标
+        metrics.RecordAPICall(r.URL.Path, r.Method, wrapped.statusCode, duration)
+        
+        // 异步发送埋点数据
+        go sendMetrics(buildMetricsPoint(r, wrapped, startTime, duration))
+    })
+}
+```
+
+#### 3.7.3 链路跟踪设计
+
+##### 1. 分布式追踪实现
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant ConfigAPI
+    participant RaftService
+    participant Cache
+    participant Database
+    
+    Client->>Gateway: Request (TraceID: T1)
+    Gateway->>ConfigAPI: Forward (SpanID: S1)
+    ConfigAPI->>Cache: Query (SpanID: S2)
+    Cache-->>ConfigAPI: Miss
+    ConfigAPI->>RaftService: Read (SpanID: S3)
+    RaftService->>Database: Query (SpanID: S4)
+    Database-->>RaftService: Data
+    RaftService-->>ConfigAPI: Result
+    ConfigAPI->>Cache: Update (SpanID: S5)
+    ConfigAPI-->>Gateway: Response
+    Gateway-->>Client: Response
+    
+    Note over Client,Database: 整个调用链通过TraceID关联
+```
+
+##### 2. Trace上下文传递
+
+```go
+// 注入trace上下文
+func InjectTraceContext(ctx context.Context, req *http.Request) {
+    span := opentracing.SpanFromContext(ctx)
+    if span != nil {
+        opentracing.GlobalTracer().Inject(
+            span.Context(),
+            opentracing.HTTPHeaders,
+            opentracing.HTTPHeadersCarrier(req.Header),
+        )
+    }
+}
+
+// 提取trace上下文
+func ExtractTraceContext(req *http.Request) opentracing.SpanContext {
+    spanCtx, _ := opentracing.GlobalTracer().Extract(
+        opentracing.HTTPHeaders,
+        opentracing.HTTPHeadersCarrier(req.Header),
+    )
+    return spanCtx
+}
+```
+
+#### 3.7.4 性能监控指标
+
+##### 1. 核心监控指标
+
+| 指标类型 | 指标名称 | 说明 | 单位 |
+|---------|---------|------|------|
+| 接口性能 | api_request_duration | 接口响应时间 | ms |
+| 接口性能 | api_request_qps | 接口请求QPS | 次/秒 |
+| 接口性能 | api_error_rate | 接口错误率 | % |
+| 系统资源 | cpu_usage | CPU使用率 | % |
+| 系统资源 | memory_usage | 内存使用率 | % |
+| 系统资源 | goroutine_count | Goroutine数量 | 个 |
+| 缓存性能 | cache_hit_rate | 缓存命中率 | % |
+| 缓存性能 | cache_operation_duration | 缓存操作耗时 | ms |
+| 数据库性能 | db_connection_count | 数据库连接数 | 个 |
+| 数据库性能 | db_query_duration | 数据库查询耗时 | ms |
+| Raft性能 | raft_commit_duration | Raft提交耗时 | ms |
+| Raft性能 | raft_apply_duration | Raft应用耗时 | ms |
+
+##### 2. Prometheus指标定义
+
+```go
+var (
+    // 接口请求计数器
+    apiRequestCounter = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "config_center_api_requests_total",
+            Help: "Total number of API requests",
+        },
+        []string{"api", "method", "status"},
+    )
+    
+    // 接口响应时间直方图
+    apiRequestDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "config_center_api_request_duration_milliseconds",
+            Help:    "API request duration in milliseconds",
+            Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
+        },
+        []string{"api", "method"},
+    )
+    
+    // 缓存命中率
+    cacheHitCounter = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "config_center_cache_hits_total",
+            Help: "Total number of cache hits",
+        },
+        []string{"cache_type", "hit"},
+    )
+)
+```
+
+#### 3.7.5 数据库故障降级方案
+
+##### 1. 降级策略设计
+
+```mermaid
+flowchart TB
+    Start[配置读取请求] --> CheckDB{检查数据库状态}
+    CheckDB -->|正常| NormalFlow[正常流程]
+    CheckDB -->|异常| CheckCache{检查缓存}
+    
+    CheckCache -->|Redis可用| GetFromRedis[从Redis获取]
+    CheckCache -->|Redis不可用| GetFromLocal[从本地缓存获取]
+    
+    GetFromRedis --> CheckVersion{检查版本}
+    GetFromLocal --> CheckVersion
+    
+    CheckVersion -->|版本在最近10个内| ReturnData[返回数据]
+    CheckVersion -->|版本过旧| ReturnWithWarning[返回数据+降级警告]
+    
+    NormalFlow --> UpdateCache[更新缓存]
+    UpdateCache --> ReturnData
+    
+    ReturnData --> End[结束]
+    ReturnWithWarning --> End
+```
+
+##### 2. 本地缓存设计
+
+```go
+type LocalCache struct {
+    mu              sync.RWMutex
+    configs         map[string]*ConfigCache  // namespace:key -> config
+    versionHistory  map[string]*VersionRing  // namespace:key -> 最近10个版本
+}
+
+type ConfigCache struct {
+    Value      interface{} `json:"value"`
+    Version    int         `json:"version"`
+    UpdatedAt  time.Time   `json:"updated_at"`
+}
+
+type VersionRing struct {
+    versions  [10]*ConfigCache  // 环形缓冲区存储最近10个版本
+    head      int               // 当前写入位置
+    count     int               // 实际版本数
+}
+
+// 降级读取逻辑
+func (c *ConfigService) GetWithFallback(namespace, key string, version int) (*Config, error) {
+    // 1. 尝试正常读取
+    config, err := c.normalGet(namespace, key, version)
+    if err == nil {
+        return config, nil
+    }
+    
+    // 2. 数据库异常，尝试Redis
+    if isDBError(err) {
+        config, err = c.getFromRedis(namespace, key, version)
+        if err == nil {
+            return config, nil
+        }
+    }
+    
+    // 3. Redis也异常，使用本地缓存
+    config, isStale := c.getFromLocalCache(namespace, key, version)
+    if config != nil {
+        if isStale {
+            // 添加降级标记
+            config.Metadata["degraded"] = true
+            config.Metadata["degraded_reason"] = "database_unavailable"
+        }
+        return config, nil
+    }
+    
+    return nil, ErrConfigNotFound
+}
+```
+
+##### 3. 健康检查机制
+
+```go
+type HealthChecker struct {
+    dbHealthy     atomic.Bool
+    redisHealthy  atomic.Bool
+    checkInterval time.Duration
+}
+
+func (h *HealthChecker) Start() {
+    ticker := time.NewTicker(h.checkInterval)
+    go func() {
+        for range ticker.C {
+            // 检查数据库健康状态
+            if err := h.checkDatabase(); err != nil {
+                h.dbHealthy.Store(false)
+                metrics.RecordHealthCheck("database", "unhealthy")
+            } else {
+                h.dbHealthy.Store(true)
+                metrics.RecordHealthCheck("database", "healthy")
+            }
+            
+            // 检查Redis健康状态
+            if err := h.checkRedis(); err != nil {
+                h.redisHealthy.Store(false)
+                metrics.RecordHealthCheck("redis", "unhealthy")
+            } else {
+                h.redisHealthy.Store(true)
+                metrics.RecordHealthCheck("redis", "healthy")
+            }
+        }
+    }()
+}
+```
+
+#### 3.7.6 监控告警规则
+
+##### 1. 告警规则配置
+
+```yaml
+groups:
+  - name: config_center_alerts
+    interval: 30s
+    rules:
+      # API性能告警
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, api_request_duration) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API响应时间过高"
+          description: "{{ $labels.api }} 接口95分位响应时间超过1秒"
+      
+      # 错误率告警
+      - alert: HighErrorRate
+        expr: rate(api_requests_total{status!="200"}[5m]) / rate(api_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "接口错误率过高"
+          description: "{{ $labels.api }} 接口错误率超过5%"
+      
+      # 缓存命中率告警
+      - alert: LowCacheHitRate
+        expr: rate(cache_hits_total{hit="true"}[5m]) / rate(cache_hits_total[5m]) < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存命中率过低"
+          description: "缓存命中率低于80%"
+      
+      # 数据库故障告警
+      - alert: DatabaseDown
+        expr: health_check_status{component="database"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "数据库连接异常"
+          description: "数据库健康检查失败，已启用降级模式"
+```
+
+##### 2. 监控大盘设计
+
+```json
+{
+  "dashboard": {
+    "title": "配置中心监控大盘",
+    "panels": [
+      {
+        "title": "API QPS",
+        "targets": [{
+          "expr": "sum(rate(api_requests_total[1m])) by (api)"
+        }]
+      },
+      {
+        "title": "API响应时间",
+        "targets": [{
+          "expr": "histogram_quantile(0.95, api_request_duration)"
+        }]
+      },
+      {
+        "title": "缓存命中率",
+        "targets": [{
+          "expr": "rate(cache_hits_total{hit=\"true\"}[5m]) / rate(cache_hits_total[5m])"
+        }]
+      },
+      {
+        "title": "系统健康状态",
+        "targets": [{
+          "expr": "health_check_status"
+        }]
+      }
+    ]
+  }
+}
+```
+
+### 3.8 接口设计
+
+#### 3.8.1 API设计原则
 
 遵循365 API规范：
 1. RESTful风格设计
@@ -653,7 +1080,7 @@ GET /api/v1/config/diff?namespace=user-service&key=database.mysql&from=3&to=5
 4. 版本化管理
 5. 统一的错误处理
 
-#### 3.7.2 统一响应格式
+#### 3.8.2 统一响应格式
 
 ```json
 {
@@ -678,7 +1105,7 @@ GET /api/v1/config/diff?namespace=user-service&key=database.mysql&from=3&to=5
 }
 ```
 
-#### 3.7.3 客户端配置读取接口
+#### 3.8.3 客户端配置读取接口
 
 ##### 1. 获取单个配置
 
@@ -801,7 +1228,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 }
 ```
 
-#### 3.7.4 后台管理接口（增强版本管理）
+#### 3.8.4 后台管理接口（增强版本管理）
 
 ##### 1. 创建配置
 
@@ -1014,7 +1441,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 }
 ```
 
-#### 3.7.5 版本管理接口（新增）
+#### 3.8.5 版本管理接口（新增）
 
 ##### 1. 获取配置版本列表
 
@@ -1107,7 +1534,7 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 }
 ```
 
-#### 3.7.6 命名空间管理接口
+#### 3.8.6 命名空间管理接口
 
 ##### 1. 创建命名空间
 
@@ -1168,7 +1595,59 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 | page | int | 否 | 页码 |
 | page_size | int | 否 | 每页数量 |
 
-#### 3.7.7 错误码定义（更新）
+#### 3.8.7 监控接口（新增）
+
+##### 1. 健康检查接口
+
+**接口地址**: `GET /api/v1/health`
+
+**响应示例**:
+```json
+{
+    "code": 0,
+    "message": "success",
+    "data": {
+        "status": "healthy",
+        "components": {
+            "database": {
+                "status": "healthy",
+                "latency_ms": 5
+            },
+            "redis": {
+                "status": "healthy",
+                "latency_ms": 2
+            },
+            "raft": {
+                "status": "healthy",
+                "role": "leader",
+                "term": 42
+            }
+        },
+        "degraded": false,
+        "uptime_seconds": 86400
+    },
+    "timestamp": 1705734400
+}
+```
+
+##### 2. 指标查询接口
+
+**接口地址**: `GET /api/v1/metrics`
+
+**响应示例**:
+```
+# HELP config_center_api_requests_total Total number of API requests
+# TYPE config_center_api_requests_total counter
+config_center_api_requests_total{api="/api/v1/config/get",method="GET",status="200"} 10234
+config_center_api_requests_total{api="/api/v1/config/get",method="GET",status="404"} 123
+
+# HELP config_center_api_request_duration_milliseconds API request duration
+# TYPE config_center_api_request_duration_milliseconds histogram
+config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",method="GET",le="10"} 8234
+config_center_api_request_duration_milliseconds_bucket{api="/api/v1/config/get",method="GET",le="50"} 9834
+```
+
+#### 3.8.8 错误码定义（更新）
 
 | 错误码 | 说明 | HTTP状态码 |
 |--------|------|-------------|
@@ -1213,6 +1692,15 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 | Token Bucket | 令牌桶算法，一种常用的限流算法 |
 | TTL | Time To Live，数据的存活时间 |
 | QPS | Queries Per Second，每秒查询数 |
+| Prometheus | 开源的监控和告警系统，使用时序数据库 |
+| Jaeger | 分布式追踪系统，用于微服务架构的性能监控 |
+| OpenTracing | 分布式追踪的标准API规范 |
+| Trace ID | 分布式追踪中的全局唯一标识符 |
+| Span | 分布式追踪中的一个工作单元 |
+| Metrics | 度量指标，用于监控系统性能 |
+| Health Check | 健康检查，用于监控服务可用性 |
+| Degraded Mode | 降级模式，系统部分功能不可用时的运行模式 |
+| Circuit Breaker | 熔断器，防止故障扩散的保护机制 |
 
 ### 5.2 参考资料
 
@@ -1227,3 +1715,8 @@ GET /api/v1/config/get?namespace=user-service&key=database.mysql.host&version=3
 9. [分布式缓存最佳实践](https://docs.microsoft.com/en-us/azure/architecture/best-practices/caching)
 10. [Rate Limiting算法详解](https://www.cloudflare.com/learning/bots/what-is-rate-limiting/)
 11. [高并发系统设计](https://github.com/donnemartin/system-design-primer)
+12. [Prometheus官方文档](https://prometheus.io/docs/)
+13. [Jaeger分布式追踪](https://www.jaegertracing.io/docs/)
+14. [OpenTracing规范](https://opentracing.io/specification/)
+15. [监控系统设计模式](https://sre.google/sre-book/monitoring-distributed-systems/)
+16. [服务降级最佳实践](https://martinfowler.com/bliki/CircuitBreaker.html)

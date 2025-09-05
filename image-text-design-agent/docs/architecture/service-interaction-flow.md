@@ -127,7 +127,7 @@ sequenceDiagram
     PS-->>GW: 项目信息 + 会话ID
     GW-->>Web: 返回结果
     
-    Web->>WSGateway: 建立WebSocket连接
+    Web->>WSG: 建立WebSocket连接
     Note over Web: 使用会话ID连接
 ```
 
@@ -164,12 +164,12 @@ sequenceDiagram
             
             alt 信息已完整
                 CS->>CS: 标记意图完整
-                break
+                Note over CS: 跳出循环
             end
         end
     end
     
-    CS->>WSG: 推送"意图确认完成"
+    CS->>WSG: 推送意图确认完成
     WSG->>Web: 显示确认信息
 ```
 
